@@ -787,6 +787,35 @@ fn gift_claim_rejects_wrong_secret_and_expired_claim() {
     assert_eq!(expired, Err(Ok(Error::GiftClaimExpired)));
 }
 
+/// Issue #323: `create_gift_claim` must not silently overwrite an active claim.
+#[test]
+fn create_gift_claim_rejects_duplicate_while_active() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+    let owner = Address::generate(&env);
+
+    let ticket_id = client.issue_ticket(
+        &organizer,
+        &1,
+        &owner,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "1"),
+        &1_000i128,
+    );
+
+    let secret_bytes = Bytes::from_array(&env, &[42u8; 32]);
+    let secret_hash = env.crypto().sha256(&secret_bytes).to_bytes();
+
+    client.create_gift_claim(&owner, &ticket_id, &secret_hash, &5_000u64);
+
+    let dup = client.try_create_gift_claim(&owner, &ticket_id, &secret_hash, &6_000u64);
+    assert_eq!(
+        dup,
+        Err(Ok(Error::GiftClaimAlreadyExists)),
+        "second create_gift_claim must be rejected while a claim is still active"
+    );
+}
+
 /// Issue #330: `claim_gift` rejects when `timestamp >= expires_at`.
 /// Test the two boundary timestamps: one tick before expiry (must succeed)
 /// and exactly at expiry (must fail).

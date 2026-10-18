@@ -130,4 +130,6 @@ pub enum Error {
     TierSoldOut = 59,
     /// The max uses is zero, or below the number of uses already recorded (issue #74).
     InvalidMaxUses = 60,
+    /// A gift claim already exists for the ticket and has not yet been claimed or expired.
+    GiftClaimAlreadyExists = 61,
 }

@@ -1106,6 +1106,11 @@ impl TicketingContract {
             return Err(Error::InvalidExpiry);
         }
 
+        let key = DataKey::GiftClaim(ticket_id);
+        if env.storage().persistent().has(&key) {
+            return Err(Error::GiftClaimAlreadyExists);
+        }
+
         let mut ticket = Self::get_ticket_inner(&env, ticket_id)?;
         if ticket.owner != owner {
             return Err(Error::NotOwner);
@@ -1124,7 +1129,6 @@ impl TicketingContract {
             secret_hash,
             expires_at,
         };
-        let key = DataKey::GiftClaim(ticket_id);
         env.storage().persistent().set(&key, &claim);
         env.storage()
             .persistent()
