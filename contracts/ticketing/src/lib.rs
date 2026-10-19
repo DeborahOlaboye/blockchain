@@ -17,12 +17,12 @@ pub use constants::{
 use constants::{LEDGER_BUMP, LEDGER_THRESHOLD};
 pub use error::Error;
 pub use events::{
-    ContractInitialized, OrganizerApproved, OrganizerRevoked, PaymentTokenChanged,
+    ContractInitialized, EventCancelled, OrganizerApproved, OrganizerRevoked, PaymentTokenChanged,
     PaymentTokenProposed, PurchaseThrottleUpdated, TicketCheckedIn, TicketIssued, TicketTransferred,
 };
 pub use types::{
     Category, DataKey, Event, EventParams, GiftClaim, PendingPaymentToken, StoredTicket, Ticket,
-    TicketStatus,
+    TicketRecipient, TicketStatus,
 };
 
 use soroban_sdk::{contract, contractimpl, token, Address, Bytes, BytesN, Env, String, Vec};
@@ -305,6 +305,8 @@ impl TicketingContract {
             ends_at: None,
             ticket_expires_at: None,
             max_reentries: 0,
+            cancelled: false,
+            royalty_splits: None,
         };
         Self::save_event(&env, event_id, &event);
         env.storage()
@@ -344,7 +346,9 @@ impl TicketingContract {
             }
         }
         let event = Self::require_organizer(&env, event_id, &organizer)?;
+        Self::ensure_not_cancelled(&event)?;
         Self::ensure_capacity(&event, winner_count as u64)?;
+        Self::reserve_tier_capacity(&env, event_id, &tier, winner_count as u64)?;
 
         env.prng().shuffle(&mut entrants);
         let mut ticket_ids = Vec::new(&env);
@@ -445,6 +449,65 @@ impl TicketingContract {
             return Err(Error::TicketsAlreadyIssued);
         }
         event.transferable = transferable;
+        Self::save_event(&env, event_id, &event);
+        Ok(())
+    }
+
+    /// Cancels an event (issue #91). A cancelled event rejects new issuance,
+    /// primary sales and resale listings. Tickets already issued are left
+    /// untouched, so existing holders keep their tickets.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::EventCancelled` if the event is already cancelled.
+    pub fn cancel_event(env: Env, organizer: Address, event_id: u64) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        let mut event = Self::require_organizer(&env, event_id, &organizer)?;
+        if event.cancelled {
+            return Err(Error::EventCancelled);
+        }
+        event.cancelled = true;
+        Self::save_event(&env, event_id, &event);
+        EventCancelled {
+            event_id,
+            organizer,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Splits the event's resale royalty between several recipients (issue
+    /// #90). Each entry is `(recipient, bps)` and the entries must sum to the
+    /// event's `royalty_bps`. `None` restores the default of paying the whole
+    /// royalty to the organizer. Applies to resales settled after the change.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidRoyalty` when the splits are empty or do not sum
+    /// to `royalty_bps`.
+    pub fn set_royalty_splits(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        splits: Option<Vec<(Address, u32)>>,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        let mut event = Self::require_organizer(&env, event_id, &organizer)?;
+        if let Some(entries) = &splits {
+            if entries.is_empty() {
+                return Err(Error::InvalidRoyalty);
+            }
+            let mut total: u64 = 0;
+            for (_, bps) in entries.iter() {
+                total += bps as u64;
+            }
+            if total != event.royalty_bps as u64 {
+                return Err(Error::InvalidRoyalty);
+            }
+        }
+        event.royalty_splits = splits;
         Self::save_event(&env, event_id, &event);
         Ok(())
     }
@@ -623,13 +686,67 @@ impl TicketingContract {
             Self::validate_label(uri, MAX_METADATA_URI_LEN)?;
         }
         let event = Self::require_organizer(&env, event_id, &organizer)?;
+        Self::ensure_not_cancelled(&event)?;
         Self::ensure_capacity(&event, 1)?;
+        Self::reserve_tier_capacity(&env, event_id, &tier, 1)?;
         let ticket_id = Self::mint(&env, event_id, to, tier, seat, price);
         if let Some(uri) = &metadata_uri {
             Self::store_metadata_uri(&env, ticket_id, uri);
         }
         Self::increment_tickets_issued(&env, event_id, 1);
         Ok(ticket_id)
+    }
+
+    /// Mints many tickets for one event in a single call (issue #88). Every
+    /// recipient goes through the same mint helper as `issue_ticket`, so each
+    /// one emits its own `TicketIssued` event. Returns the new ticket ids in
+    /// the same order as `recipients`.
+    ///
+    /// Bounded by `MAX_BATCH_SIZE` and atomic: if any recipient fails
+    /// validation, no ticket from this call is minted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::EmptyBatch` for an empty list, `Error::BatchTooLarge`
+    /// above `MAX_BATCH_SIZE`, and `Error::SoldOut` or `Error::TierSoldOut`
+    /// when the batch would exceed the event or tier cap.
+    pub fn issue_tickets(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        recipients: Vec<TicketRecipient>,
+    ) -> Result<Vec<u64>, Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        Self::require_initialized(&env)?;
+        if recipients.is_empty() {
+            return Err(Error::EmptyBatch);
+        }
+        if recipients.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        let event = Self::require_organizer(&env, event_id, &organizer)?;
+        Self::ensure_not_cancelled(&event)?;
+        Self::ensure_capacity(&event, recipients.len() as u64)?;
+        let mut ticket_ids = Vec::new(&env);
+        for recipient in recipients.iter() {
+            if recipient.price < 0 {
+                return Err(Error::InvalidPrice);
+            }
+            Self::validate_ticket_labels(&recipient.tier, &recipient.seat)?;
+            Self::reserve_tier_capacity(&env, event_id, &recipient.tier, 1)?;
+            let ticket_id = Self::mint(
+                &env,
+                event_id,
+                recipient.to,
+                recipient.tier,
+                recipient.seat,
+                recipient.price,
+            );
+            ticket_ids.push_back(ticket_id);
+        }
+        Self::increment_tickets_issued(&env, event_id, recipients.len() as u64);
+        Ok(ticket_ids)
     }
 
     /// Sets the organizer's primary sale price for one of an event's tiers
@@ -665,6 +782,43 @@ impl TicketingContract {
     /// Returns `TierPriceNotSet` when the organizer has not priced the tier.
     pub fn get_tier_price(env: Env, event_id: u64, tier: String) -> Result<i128, Error> {
         Self::tier_price(&env, event_id, &tier)
+    }
+
+    /// Caps how many tickets one of an event's tiers may ever issue (issue
+    /// #93). `None` removes the cap. Every mint path counts toward the tier
+    /// whether or not a cap is set, so the cap can be added at any time, but
+    /// it cannot be set below the number of tickets already issued in the tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidCapacity` for a zero cap or one below the tier's
+    /// issued count.
+    pub fn set_tier_capacity(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        tier: String,
+        cap: Option<u64>,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        Self::require_organizer(&env, event_id, &organizer)?;
+        Self::validate_label(&tier, MAX_TICKET_LABEL_LEN)?;
+        let key = DataKey::TierCapacity(event_id, tier.clone());
+        match cap {
+            Some(max) => {
+                let issued = Self::tier_issued(&env, event_id, &tier);
+                if max == 0 || max < issued {
+                    return Err(Error::InvalidCapacity);
+                }
+                env.storage().persistent().set(&key, &max);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+            }
+            None => env.storage().persistent().remove(&key),
+        }
+        Ok(())
     }
 
     /// Internal lookup of an event's tier price, also extending the entry's
@@ -705,8 +859,10 @@ impl TicketingContract {
         Self::validate_ticket_labels(&tier, &seat)?;
         Self::enforce_purchase_throttle(&env, &buyer)?;
         let mut event = Self::get_event_inner(&env, event_id)?;
+        Self::ensure_not_cancelled(&event)?;
         Self::ensure_capacity(&event, 1)?;
         let price = Self::tier_price(&env, event_id, &tier)?;
+        Self::reserve_tier_capacity(&env, event_id, &tier, 1)?;
         let token_client = token::Client::new(&env, &Self::payment_token_for_event(&env, &event)?);
         if price > 0 {
             if event.escrow_enabled {
@@ -1274,6 +1430,7 @@ impl TicketingContract {
         }
         Self::require_not_terminal(&ticket)?;
         let event = Self::get_event_inner(&env, ticket.event_id)?;
+        Self::ensure_not_cancelled(&event)?;
         Self::ensure_transferable(&event)?;
         if Self::resale_closed(&env, &event) {
             return Err(Error::ResaleClosed);
@@ -1433,7 +1590,7 @@ impl TicketingContract {
         // --- interactions: the only untrusted calls, after state is final.
         let token_client = token::Client::new(&env, &token_address);
         if royalty > 0 {
-            token_client.transfer(&buyer, &event.organizer, &royalty);
+            Self::pay_royalty(&token_client, &buyer, &event, royalty)?;
         }
         if seller_amount > 0 {
             token_client.transfer(&buyer, &seller, &seller_amount);
@@ -1892,6 +2049,81 @@ impl TicketingContract {
             Some(max) if event.tickets_issued.saturating_add(amount) > max => Err(Error::SoldOut),
             _ => Ok(()),
         }
+    }
+
+    /// Rejects every new issuance, sale or listing once the organizer has
+    /// cancelled the event (issue #91).
+    fn ensure_not_cancelled(event: &Event) -> Result<(), Error> {
+        if event.cancelled {
+            return Err(Error::EventCancelled);
+        }
+        Ok(())
+    }
+
+    /// Number of tickets issued so far in one of an event's tiers (issue #93).
+    fn tier_issued(env: &Env, event_id: u64, tier: &String) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TierIssued(event_id, tier.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Counts `amount` more tickets against a tier and rejects the mint when
+    /// the tier's cap would be exceeded (issue #93). Every mint path calls
+    /// this, so tiers are tracked even when no cap is set.
+    fn reserve_tier_capacity(
+        env: &Env,
+        event_id: u64,
+        tier: &String,
+        amount: u64,
+    ) -> Result<(), Error> {
+        let next = Self::tier_issued(env, event_id, tier).saturating_add(amount);
+        let cap_key = DataKey::TierCapacity(event_id, tier.clone());
+        if let Some(cap) = env.storage().persistent().get::<_, u64>(&cap_key) {
+            if next > cap {
+                return Err(Error::TierSoldOut);
+            }
+        }
+        let issued_key = DataKey::TierIssued(event_id, tier.clone());
+        env.storage().persistent().set(&issued_key, &next);
+        env.storage()
+            .persistent()
+            .extend_ttl(&issued_key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        Ok(())
+    }
+
+    /// Pays a resale royalty to the organizer, or splits it across the event's
+    /// `royalty_splits` when set (issue #90). Each share is `royalty * bps /
+    /// royalty_bps`, and the last recipient takes the rounding remainder so the
+    /// payouts always add up to `royalty`.
+    fn pay_royalty(
+        token_client: &token::Client,
+        buyer: &Address,
+        event: &Event,
+        royalty: i128,
+    ) -> Result<(), Error> {
+        let splits = match &event.royalty_splits {
+            Some(splits) => splits,
+            None => {
+                token_client.transfer(buyer, &event.organizer, &royalty);
+                return Ok(());
+            }
+        };
+        let last = splits.len().saturating_sub(1);
+        let mut paid: i128 = 0;
+        for (i, (recipient, bps)) in splits.iter().enumerate() {
+            let share = if i as u32 == last {
+                royalty - paid
+            } else {
+                royalty.checked_mul(bps as i128).ok_or(Error::MathOverflow)?
+                    / event.royalty_bps as i128
+            };
+            paid += share;
+            if share > 0 {
+                token_client.transfer(buyer, &recipient, &share);
+            }
+        }
+        Ok(())
     }
 
     /// Rejects check-in before the window opens or after it closes (issue
