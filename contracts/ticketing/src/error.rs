@@ -107,4 +107,18 @@ pub enum Error {
     TicketNotUsed = 48,
     /// The used ticket's retention period has not elapsed yet (issue #113).
     RetentionPeriodNotElapsed = 49,
+    /// The contract is currently paused by the admin.
+    ContractPaused = 50,
+    /// The refund window for this ticket has expired.
+    RefundWindowExpired = 51,
+    /// The ticket has already been refunded.
+    AlreadyRefunded = 52,
+    /// The wallet has reached its purchase limit for this event.
+    PurchaseLimitExceeded = 53,
+    /// The caller is not on the event's allowlist during presale.
+    NotOnAllowlist = 54,
+    /// The presale window has not started yet.
+    PresaleNotStarted = 55,
+    /// The presale window has ended.
+    PresaleEnded = 56,
 }

@@ -39,6 +39,8 @@ pub enum TicketStatus {
     Revoked,
     /// Listed on the resale marketplace.
     Resale,
+    /// Refunded and voided.
+    Refunded,
 }
 
 /// Configuration parameters for registering an event via `create_event`.
@@ -60,6 +62,14 @@ pub struct EventParams {
     pub transfer_freeze_seconds: u64,
     /// Seconds before `starts_at` after which resale listings are closed.
     pub resale_cutoff_seconds: u64,
+    /// Optional max tickets per wallet for primary sales.
+    pub max_per_wallet: Option<u32>,
+    /// Optional refund window in seconds after purchase.
+    pub refund_window_seconds: Option<u64>,
+    /// Optional presale start timestamp.
+    pub presale_starts_at: Option<u64>,
+    /// Optional presale end timestamp.
+    pub presale_ends_at: Option<u64>,
 }
 
 /// An event registered by an organizer.
@@ -116,6 +126,14 @@ pub struct Event {
     /// gifted, listed for resale or bought on the resale market (issue #108).
     /// Defaults to true. Settable only before tickets are issued.
     pub transferable: bool,
+    /// Optional max tickets per wallet for primary sales.
+    pub max_per_wallet: Option<u32>,
+    /// Optional refund window in seconds after purchase.
+    pub refund_window_seconds: Option<u64>,
+    /// Optional presale start timestamp.
+    pub presale_starts_at: Option<u64>,
+    /// Optional presale end timestamp.
+    pub presale_ends_at: Option<u64>,
 }
 
 /// A ticket minted for an event.
@@ -138,6 +156,8 @@ pub struct Ticket {
     pub resale_price: i128,
     /// Number of ownership transfers completed for this ticket.
     pub transfers: u32,
+    /// Ledger timestamp when this ticket was purchased.
+    pub purchased_at: u64,
 }
 
 /// Compact persistent representation for a ticket.
@@ -162,6 +182,8 @@ pub struct StoredTicket {
     pub original_price: i128,
     /// Asking price while the ticket is listed for resale; 0 otherwise.
     pub resale_price: i128,
+    /// Ledger timestamp when this ticket was purchased.
+    pub purchased_at: u64,
 }
 
 /// A pending gift-claim link for a ticket.
@@ -245,6 +267,12 @@ pub enum DataKey {
     /// Position of a ticket inside its owner's index, so a transfer or burn can
     /// remove it in constant time (issue #111).
     TicketOwnerPos(u64),
+    /// Contract paused status.
+    Paused,
+    /// Number of tickets purchased by a wallet for an event.
+    WalletPurchaseCount(u64, Address),
+    /// Allowlist member for an event.
+    AllowlistMember(u64, Address),
 }
 
 // Keep the persistent encoding beside the public and stored ticket types.
@@ -258,6 +286,7 @@ impl StoredTicket {
             lifecycle: ((ticket.transfers as u64) << 8) | Self::status_code(&ticket.status),
             original_price: ticket.original_price,
             resale_price: ticket.resale_price,
+            purchased_at: ticket.purchased_at,
         }
     }
 
@@ -273,6 +302,7 @@ impl StoredTicket {
             original_price: stored.original_price,
             resale_price: stored.resale_price,
             transfers,
+            purchased_at: stored.purchased_at,
         })
     }
 
@@ -282,6 +312,7 @@ impl StoredTicket {
             TicketStatus::Used => 1,
             TicketStatus::Revoked => 2,
             TicketStatus::Resale => 3,
+            TicketStatus::Refunded => 4,
         }
     }
 
@@ -291,6 +322,7 @@ impl StoredTicket {
             1 => Ok(TicketStatus::Used),
             2 => Ok(TicketStatus::Revoked),
             3 => Ok(TicketStatus::Resale),
+            4 => Ok(TicketStatus::Refunded),
             _ => Err(Error::InvalidTicketLifecycle),
         }
     }
