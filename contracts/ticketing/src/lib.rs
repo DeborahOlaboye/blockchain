@@ -11,8 +11,8 @@ mod types;
 pub use constants::{
     BPS_DENOMINATOR, CATEGORY_CONCERT, CATEGORY_CONFERENCE, CATEGORY_FESTIVAL, CATEGORY_FLIGHT,
     CATEGORY_OTHER, CATEGORY_SPORTS, MAX_BATCH_SIZE, MAX_CATEGORY_LEN, MAX_METADATA_URI_LEN,
-    MAX_NAME_LEN, MAX_PAGE_SIZE, MAX_TICKET_LABEL_LEN, PAYMENT_TOKEN_CHANGE_DELAY_LEDGERS,
-    USED_TICKET_RETENTION_SECONDS,
+    MAX_NAME_LEN, MAX_OWNER_HISTORY, MAX_PAGE_SIZE, MAX_TICKET_LABEL_LEN, MAX_TIER_ZONES,
+    PAYMENT_TOKEN_CHANGE_DELAY_LEDGERS, USED_TICKET_RETENTION_SECONDS,
 };
 use constants::{LEDGER_BUMP, LEDGER_THRESHOLD};
 pub use error::Error;
@@ -918,6 +918,7 @@ impl TicketingContract {
         Self::enforce_purchase_throttle(&env, &buyer)?;
         let mut event = Self::get_event_inner(&env, event_id)?;
         Self::ensure_not_cancelled(&event)?;
+        Self::ensure_sale_open(&env, event_id)?;
         Self::ensure_capacity(&event, 1)?;
         let price = Self::tier_price(&env, event_id, &tier)?;
         Self::reserve_tier_capacity(&env, event_id, &tier, 1)?;
@@ -1246,24 +1247,156 @@ impl TicketingContract {
     pub fn check_in(env: Env, organizer: Address, ticket_id: u64) -> Result<(), Error> {
         Self::extend_instance_ttl(&env);
         organizer.require_auth();
-        let mut ticket = Self::get_ticket_inner(&env, ticket_id)?;
-        let event = Self::require_organizer(&env, ticket.event_id, &organizer)?;
-        Self::ensure_check_in_window(&env, &event)?;
-        Self::ensure_not_expired(&env, &event)?;
-        Self::require_not_terminal(&ticket)?;
-        if ticket.status == TicketStatus::Resale {
-            return Err(Error::ResaleListingActive);
+        Self::do_check_in(&env, &organizer, ticket_id, None)
+    }
+
+    /// Checks a ticket in at a specific zone or gate (issue #80). Fails with
+    /// `Error::ZoneNotAllowed` when the ticket's tier is restricted to other
+    /// zones; tiers with no zone list may enter anywhere. `signer` is the
+    /// organizer or one of the event's check-in signers (issue #89).
+    pub fn check_in_at_zone(
+        env: Env,
+        signer: Address,
+        ticket_id: u64,
+        zone: String,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        signer.require_auth();
+        Self::do_check_in(&env, &signer, ticket_id, Some(zone))
+    }
+
+    /// Restricts a tier to a set of zones/gates (issue #80). An empty list
+    /// removes the restriction. At most `MAX_TIER_ZONES` labels, each
+    /// non-empty and at most `MAX_TICKET_LABEL_LEN` bytes.
+    pub fn set_tier_zones(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        tier: String,
+        zones: Vec<String>,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        Self::require_organizer(&env, event_id, &organizer)?;
+        Self::validate_label(&tier, MAX_TICKET_LABEL_LEN)?;
+        if zones.len() > MAX_TIER_ZONES {
+            return Err(Error::InvalidZones);
         }
-        Self::consume_use(&env, ticket_id, &mut ticket);
-        ticket.resale_price = 0;
-        Self::remove_gift_claim(&env, ticket_id);
-        Self::save_ticket(&env, ticket_id, &ticket);
-        TicketCheckedIn {
-            ticket_id,
-            organizer,
+        for zone in zones.iter() {
+            if zone.is_empty() || zone.len() > MAX_TICKET_LABEL_LEN {
+                return Err(Error::InvalidZones);
+            }
         }
-        .publish(&env);
+        let key = DataKey::TierZones(event_id, tier);
+        if zones.is_empty() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &zones);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        }
         Ok(())
+    }
+
+    /// Zones a tier may enter; empty when the tier is unrestricted (issue #80).
+    pub fn tier_zones(env: Env, event_id: u64, tier: String) -> Vec<String> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TierZones(event_id, tier))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Lets `signer` (e.g. a gate device key) check tickets in for the event,
+    /// so gates don't need the organizer's master key (issue #89).
+    pub fn add_checkin_signer(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        signer: Address,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        Self::require_organizer(&env, event_id, &organizer)?;
+        let key = DataKey::CheckInSigner(event_id, signer);
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        Ok(())
+    }
+
+    /// Revokes a delegated check-in signer (issue #89).
+    pub fn remove_checkin_signer(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        signer: Address,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        Self::require_organizer(&env, event_id, &organizer)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CheckInSigner(event_id, signer));
+        Ok(())
+    }
+
+    /// Whether `signer` is a delegated check-in signer for the event (issue #89).
+    pub fn is_checkin_signer(env: Env, event_id: u64, signer: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::CheckInSigner(event_id, signer))
+    }
+
+    /// Sets the primary sale window in ledger seconds (issue #94).
+    /// `purchase_primary` fails with `SaleNotStarted` before `sale_start` and
+    /// `SaleEnded` from `sale_end` on. `None` leaves that side open; passing
+    /// `None` for both removes the window.
+    pub fn set_event_sale_window(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        sale_start: Option<u64>,
+        sale_end: Option<u64>,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        Self::require_organizer(&env, event_id, &organizer)?;
+        if let (Some(start), Some(end)) = (sale_start, sale_end) {
+            if end <= start {
+                return Err(Error::InvalidSaleWindow);
+            }
+        }
+        let key = DataKey::SaleWindow(event_id);
+        if sale_start.is_none() && sale_end.is_none() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&key, &(sale_start, sale_end));
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        }
+        Ok(())
+    }
+
+    /// The event's primary sale window `(sale_start, sale_end)` (issue #94).
+    pub fn sale_window(env: Env, event_id: u64) -> (Option<u64>, Option<u64>) {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SaleWindow(event_id))
+            .unwrap_or((None, None))
+    }
+
+    /// Previous owners of a ticket, oldest first, keeping the last
+    /// `MAX_OWNER_HISTORY` (issue #82). The current owner is not included.
+    pub fn owner_history(env: Env, ticket_id: u64) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OwnerHistory(ticket_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Marks a batch of tickets as used at the point of entry for group admission.
@@ -1287,7 +1420,7 @@ impl TicketingContract {
         }
         for ticket_id in ticket_ids.iter() {
             let mut ticket = Self::get_ticket_inner(&env, ticket_id)?;
-            let event = Self::require_organizer(&env, ticket.event_id, &organizer)?;
+            let event = Self::require_check_in_authority(&env, ticket.event_id, &organizer)?;
             Self::ensure_check_in_window(&env, &event)?;
             Self::ensure_not_expired(&env, &event)?;
             Self::require_not_terminal(&ticket)?;
@@ -1879,6 +2012,115 @@ impl TicketingContract {
 
     /// Loads an event and verifies its organizer after the caller has
     /// required authorization at the entry point.
+    /// Shared body of `check_in` / `check_in_at_zone`. Callers have already
+    /// required `signer`'s auth.
+    fn do_check_in(
+        env: &Env,
+        signer: &Address,
+        ticket_id: u64,
+        zone: Option<String>,
+    ) -> Result<(), Error> {
+        let mut ticket = Self::get_ticket_inner(env, ticket_id)?;
+        let event = Self::require_check_in_authority(env, ticket.event_id, signer)?;
+        Self::ensure_check_in_window(env, &event)?;
+        Self::ensure_not_expired(env, &event)?;
+        Self::require_not_terminal(&ticket)?;
+        if ticket.status == TicketStatus::Resale {
+            return Err(Error::ResaleListingActive);
+        }
+        if let Some(zone) = zone {
+            Self::ensure_zone_allowed(env, ticket.event_id, &ticket.tier, &zone)?;
+        }
+        Self::consume_use(env, ticket_id, &mut ticket);
+        ticket.resale_price = 0;
+        Self::remove_gift_claim(env, ticket_id);
+        Self::save_ticket(env, ticket_id, &ticket);
+        TicketCheckedIn {
+            ticket_id,
+            organizer: signer.clone(),
+        }
+        .publish(env);
+        Ok(())
+    }
+
+    /// The organizer, or a delegated check-in signer for the event (issue
+    /// #89). Anyone else gets `Error::NotOrganizer`.
+    fn require_check_in_authority(
+        env: &Env,
+        event_id: u64,
+        signer: &Address,
+    ) -> Result<Event, Error> {
+        let event = Self::get_event_inner(env, event_id)?;
+        if event.organizer == *signer
+            || env
+                .storage()
+                .persistent()
+                .has(&DataKey::CheckInSigner(event_id, signer.clone()))
+        {
+            return Ok(event);
+        }
+        Err(Error::NotOrganizer)
+    }
+
+    /// Tiers with no zone list may enter anywhere (issue #80).
+    fn ensure_zone_allowed(
+        env: &Env,
+        event_id: u64,
+        tier: &String,
+        zone: &String,
+    ) -> Result<(), Error> {
+        let zones: Option<Vec<String>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TierZones(event_id, tier.clone()));
+        match zones {
+            Some(zones) if !zones.contains(zone) => Err(Error::ZoneNotAllowed),
+            _ => Ok(()),
+        }
+    }
+
+    /// Enforces the optional primary sale window (issue #94).
+    fn ensure_sale_open(env: &Env, event_id: u64) -> Result<(), Error> {
+        let window: Option<(Option<u64>, Option<u64>)> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SaleWindow(event_id));
+        let Some((start, end)) = window else {
+            return Ok(());
+        };
+        let now = env.ledger().timestamp();
+        if let Some(start) = start {
+            if now < start {
+                return Err(Error::SaleNotStarted);
+            }
+        }
+        if let Some(end) = end {
+            if now >= end {
+                return Err(Error::SaleEnded);
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends `previous` to a ticket's bounded owner history (issue #82),
+    /// dropping the oldest entry once `MAX_OWNER_HISTORY` is reached.
+    fn record_previous_owner(env: &Env, ticket_id: u64, previous: &Address) {
+        let key = DataKey::OwnerHistory(ticket_id);
+        let mut history: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        while history.len() >= MAX_OWNER_HISTORY {
+            history.pop_front();
+        }
+        history.push_back(previous.clone());
+        env.storage().persistent().set(&key, &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+    }
+
     fn require_organizer(env: &Env, event_id: u64, organizer: &Address) -> Result<Event, Error> {
         let event = Self::get_event_inner(env, event_id)?;
         if event.organizer != *organizer {
@@ -1963,6 +2205,7 @@ impl TicketingContract {
     /// Records one ticket leaving `from` and one arriving at `to` (issue
     /// #110). Callers pass the owner as it stood before the change.
     fn move_owner_balance(env: &Env, ticket_id: u64, from: &Address, to: &Address) {
+        Self::record_previous_owner(env, ticket_id, from);
         Self::debit_owner_balance(env, from);
         Self::credit_owner_balance(env, to);
         Self::remove_from_owner_index(env, from, ticket_id);

@@ -295,6 +295,19 @@ pub enum DataKey {
     /// Optional issuance cap for one of an event's tiers (issue #93). Absent
     /// means the tier is uncapped.
     TierCapacity(u64, String),
+    /// Zones/gates a tier may enter, keyed by event id and tier (issue #80).
+    /// Absent means the tier is unrestricted.
+    TierZones(u64, String),
+    /// Previous owners of a ticket, oldest first, capped at
+    /// `MAX_OWNER_HISTORY` (issue #82). Absent until the first transfer.
+    OwnerHistory(u64),
+    /// Optional primary sale window `(sale_start, sale_end)` for an event, in
+    /// ledger seconds (issue #94). Stored apart from `Event` so setting it
+    /// never rewrites the event record and old records stay readable.
+    SaleWindow(u64),
+    /// Presence marks an address allowed to check tickets in for an event on
+    /// the organizer's behalf, e.g. a gate device (issue #89).
+    CheckInSigner(u64, Address),
 }
 
 // Keep the persistent encoding beside the public and stored ticket types.
