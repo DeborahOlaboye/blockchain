@@ -140,4 +140,6 @@ pub enum Error {
     SaleEnded = 64,
     /// The sale window ends at or before it starts (issue #94).
     InvalidSaleWindow = 65,
+    /// A gift claim already exists for the ticket and has not yet been claimed or expired.
+    GiftClaimAlreadyExists = 61,
 }

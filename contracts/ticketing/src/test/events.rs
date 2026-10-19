@@ -408,6 +408,50 @@ fn release_escrow_pays_the_organizer_after_the_event_ends() {
 }
 
 #[test]
+fn release_escrow_pays_out_in_per_event_payment_token() {
+    let (env, client, token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    // Second token: the event's accepted payment token (issue #332).
+    let token2_admin = Address::generate(&env);
+    let token2_contract = env.register_stellar_asset_contract_v2(token2_admin);
+    let token2 = TokenClient::new(&env, &token2_contract.address());
+    let token2_asset = StellarAssetClient::new(&env, &token2_contract.address());
+
+    client.set_event_payment_token(&organizer, &1, &Some(token2_contract.address()));
+    assert_eq!(client.event_payment_token(&1), token2_contract.address());
+    client.enable_escrow(&organizer, &1, &500u32);
+
+    let buyer = Address::generate(&env);
+    token2_asset.mint(&buyer, &10_000i128);
+
+    client.set_tier_price(&organizer, &1, &String::from_str(&env, "GA"), &2_000i128);
+    client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "1"),
+    );
+
+    // Escrow must be held in the event token, not the contract token.
+    assert_eq!(client.get_event(&1).escrow_balance, 2_000);
+    assert_eq!(token2.balance(&client.address), 2_000);
+    assert_eq!(token2.balance(&buyer), 8_000);
+    assert_eq!(token.balance(&client.address), 0);
+    assert_eq!(token.balance(&organizer), 0);
+
+    env.ledger().set_sequence_number(500);
+    client.release_escrow(&organizer, &1);
+
+    // Release must pay out in the event token; contract-token balances stay put.
+    assert_eq!(token2.balance(&organizer), 2_000);
+    assert_eq!(token2.balance(&client.address), 0);
+    assert_eq!(token.balance(&organizer), 0);
+    assert_eq!(token.balance(&client.address), 0);
+    assert_eq!(client.get_event(&1).escrow_balance, 0);
+}
+
+#[test]
 fn release_escrow_rejects_a_non_escrow_event() {
     let (env, client, _token, _token_asset, _admin, organizer) = setup();
     make_event(&env, &client, &organizer, 1);
@@ -430,6 +474,51 @@ fn enable_escrow_rejects_once_tickets_have_been_sold() {
     );
     let result = client.try_enable_escrow(&organizer, &1, &500u32);
     assert_eq!(result, Err(Ok(Error::EventAlreadyStarted)));
+}
+
+/// Issue #336: `enable_escrow` with a past (or current) release ledger is
+/// rejected.
+///
+/// The escrow release ledger must be strictly in the future
+/// (`escrow_release_ledger > current ledger`, see `enable_escrow` in
+/// `lib.rs` which returns `Error::EventNotEnded` otherwise). A past ledger
+/// would otherwise make `release_escrow` immediately releasable and defeat
+/// the escrow hold.
+#[test]
+fn enable_escrow_rejects_past_release_ledger() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    // Pin the current ledger so the test does not depend on the default
+    // sequence of the test host.
+    env.ledger().set_sequence_number(500);
+
+    // A release ledger in the past must be rejected.
+    let past = client.try_enable_escrow(&organizer, &1, &499u32);
+    assert_eq!(past, Err(Ok(Error::EventNotEnded)));
+
+    // The boundary is strict: a release ledger equal to the current ledger
+    // is not in the future and must also be rejected.
+    let current = client.try_enable_escrow(&organizer, &1, &500u32);
+    assert_eq!(current, Err(Ok(Error::EventNotEnded)));
+
+    // Rejected calls must not partially enable escrow.
+    let event = client.get_event(&1);
+    assert!(
+        !event.escrow_enabled,
+        "rejected enable_escrow must leave escrow disabled"
+    );
+    assert_eq!(
+        event.escrow_release_ledger, 0,
+        "rejected enable_escrow must not set a release ledger"
+    );
+
+    // A strictly future ledger is accepted, proving the rejection above is
+    // about the ledger and not some other event state.
+    client.enable_escrow(&organizer, &1, &501u32);
+    let event = client.get_event(&1);
+    assert!(event.escrow_enabled);
+    assert_eq!(event.escrow_release_ledger, 501);
 }
 
 #[test]
