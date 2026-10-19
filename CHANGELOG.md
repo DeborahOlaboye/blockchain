@@ -18,6 +18,13 @@ This project follows [Keep a Changelog](https://keepachangelog.com/).
   for the dependency versioning policy and upgrade procedure.
 
 ### Added
+- Marketplace and sale events for indexers. `create_event` publishes
+  `EventCreated` (`organizer` and `event_id` topics) (#119). `purchase_primary`
+  publishes `PrimarySale` (`ticket_id` topic, `buyer`, `price`) (#118).
+  `list_for_resale` publishes `TicketListed` and `cancel_resale` publishes
+  `ListingCancelled` (`ticket_id` topic, `owner`) (#116). `buy_resale`
+  publishes `TicketResold` (`ticket_id` topic, `seller`, `buyer`, `price`,
+  `royalty`) (#117). Rejected calls publish none of these.
 - Multi-use tickets (passes): `set_ticket_max_uses` sets how many entries a
   ticket allows (default 1). `check_in` and `check_in_batch` count each entry,
   and a ticket becomes `Used` only once its uses are exhausted. `pass_out`

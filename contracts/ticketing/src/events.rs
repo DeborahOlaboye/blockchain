@@ -97,3 +97,54 @@ pub struct TicketTransferred {
     pub from: Address,
     pub to: Address,
 }
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Emitted when an organizer registers a new event (issue #119).
+pub struct EventCreated {
+    #[topic]
+    pub organizer: Address,
+    #[topic]
+    pub event_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Emitted when a ticket is sold through `purchase_primary` (issue #118).
+pub struct PrimarySale {
+    #[topic]
+    pub ticket_id: u64,
+    pub buyer: Address,
+    pub price: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Emitted when a ticket is listed for resale through `list_for_resale` (issue #116).
+pub struct TicketListed {
+    #[topic]
+    pub ticket_id: u64,
+    pub owner: Address,
+    pub price: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Emitted when a resale listing is cancelled through `cancel_resale` (issue #116).
+pub struct ListingCancelled {
+    #[topic]
+    pub ticket_id: u64,
+    pub owner: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Emitted when a resale listing is bought through `buy_resale` (issue #117).
+pub struct TicketResold {
+    #[topic]
+    pub ticket_id: u64,
+    pub seller: Address,
+    pub buyer: Address,
+    pub price: i128,
+    pub royalty: i128,
+}
