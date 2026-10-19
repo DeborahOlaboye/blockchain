@@ -49,6 +49,9 @@ clients do not break. It may be removed only in a future breaking deployment.
 | `burn_used_ticket(organizer, ticket_id)` | `organizer` | Deletes a checked-in ticket's record once `starts_at + USED_TICKET_RETENTION_SECONDS` (30 days) has passed (issue #113). |
 | `pass_out(organizer, ticket_id)` | `organizer` | Returns a checked-in ticket to `Valid` so it can re-enter, up to the event's `max_reentries`. Returns the new re-entry count (issue #78). |
 | `reentry_count(ticket_id)` | anyone | Number of times a ticket has been passed out for re-entry (issue #78). |
+| `set_ticket_max_uses(organizer, ticket_id, max_uses)` | `organizer` | Sets how many entries a ticket allows before it is fully used. Defaults to 1. Zero, or a value below the recorded uses, is rejected (issue #74). |
+| `ticket_max_uses(ticket_id)` | anyone | Number of entries a ticket allows (issue #74). |
+| `ticket_used_count(ticket_id)` | anyone | Number of entries recorded against a ticket (issue #74). |
 | `set_seat(organizer, ticket_id, seat)` | `organizer` | Reassigns a ticket's seat before transfer/check-in restrictions apply. |
 | `revoke_with_refund(organizer, ticket_id, refund)` | `organizer` | Revokes a ticket and optionally refunds its original price. |
 | `revoke_batch(organizer, ticket_ids)` | `organizer` | Atomically revokes a bounded batch of tickets. |
