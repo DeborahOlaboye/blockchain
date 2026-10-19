@@ -389,6 +389,50 @@ fn release_escrow_pays_the_organizer_after_the_event_ends() {
 }
 
 #[test]
+fn release_escrow_pays_out_in_per_event_payment_token() {
+    let (env, client, token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    // Second token: the event's accepted payment token (issue #332).
+    let token2_admin = Address::generate(&env);
+    let token2_contract = env.register_stellar_asset_contract_v2(token2_admin);
+    let token2 = TokenClient::new(&env, &token2_contract.address());
+    let token2_asset = StellarAssetClient::new(&env, &token2_contract.address());
+
+    client.set_event_payment_token(&organizer, &1, &Some(token2_contract.address()));
+    assert_eq!(client.event_payment_token(&1), token2_contract.address());
+    client.enable_escrow(&organizer, &1, &500u32);
+
+    let buyer = Address::generate(&env);
+    token2_asset.mint(&buyer, &10_000i128);
+
+    client.set_tier_price(&organizer, &1, &String::from_str(&env, "GA"), &2_000i128);
+    client.purchase_primary(
+        &buyer,
+        &1,
+        &String::from_str(&env, "GA"),
+        &String::from_str(&env, "1"),
+    );
+
+    // Escrow must be held in the event token, not the contract token.
+    assert_eq!(client.get_event(&1).escrow_balance, 2_000);
+    assert_eq!(token2.balance(&client.address), 2_000);
+    assert_eq!(token2.balance(&buyer), 8_000);
+    assert_eq!(token.balance(&client.address), 0);
+    assert_eq!(token.balance(&organizer), 0);
+
+    env.ledger().set_sequence_number(500);
+    client.release_escrow(&organizer, &1);
+
+    // Release must pay out in the event token; contract-token balances stay put.
+    assert_eq!(token2.balance(&organizer), 2_000);
+    assert_eq!(token2.balance(&client.address), 0);
+    assert_eq!(token.balance(&organizer), 0);
+    assert_eq!(token.balance(&client.address), 0);
+    assert_eq!(client.get_event(&1).escrow_balance, 0);
+}
+
+#[test]
 fn release_escrow_rejects_a_non_escrow_event() {
     let (env, client, _token, _token_asset, _admin, organizer) = setup();
     make_event(&env, &client, &organizer, 1);
