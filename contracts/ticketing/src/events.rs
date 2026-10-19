@@ -81,6 +81,15 @@ pub struct OrganizerRevoked {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Emitted when the organizer cancels an event (issue #91).
+pub struct EventCancelled {
+    #[topic]
+    pub event_id: u64,
+    pub organizer: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 /// Emitted when a ticket changes owner through `transfer_ticket` (issue #115).
 pub struct TicketTransferred {
     #[topic]

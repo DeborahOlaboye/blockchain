@@ -123,4 +123,9 @@ pub enum Error {
     ReentryNotAllowed = 56,
     /// The ticket has used all of its allowed re-entries (issue #78).
     ReentryLimitReached = 57,
+    /// The event has been cancelled by its organizer, so it can no longer
+    /// issue, sell or list tickets, and cannot be cancelled again (issue #91).
+    EventCancelled = 58,
+    /// The tier has reached its issuance cap (issue #93).
+    TierSoldOut = 59,
 }

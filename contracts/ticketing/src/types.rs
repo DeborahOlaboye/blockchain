@@ -2,7 +2,7 @@
 #![allow(missing_docs)]
 
 use crate::Error;
-use soroban_sdk::{contracttype, Address, BytesN, String};
+use soroban_sdk::{contracttype, Address, BytesN, String, Vec};
 
 /// Optional common category labels for indexers and client applications.
 ///
@@ -132,6 +132,27 @@ pub struct Event {
     /// How many times a checked-in ticket may be passed back out for re-entry
     /// (issue #78). `0` disables re-entry for the event.
     pub max_reentries: u32,
+    /// True once the organizer has cancelled the event (issue #91). A cancelled
+    /// event cannot issue, sell or list tickets.
+    pub cancelled: bool,
+    /// Optional split of `royalty_bps` between several recipients (issue #90).
+    /// Each entry is `(recipient, bps)` and the entries sum to `royalty_bps`.
+    /// `None` pays the whole royalty to the organizer.
+    pub royalty_splits: Option<Vec<(Address, u32)>>,
+}
+
+/// One mint request in a batch issuance (issue #88).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketRecipient {
+    /// Account that receives the ticket.
+    pub to: Address,
+    /// Ticket tier name, e.g. "VIP" or "GA".
+    pub tier: String,
+    /// Assigned seat, or "unassigned" for general admission.
+    pub seat: String,
+    /// Price paid at primary sale; used for resale caps and refunds.
+    pub price: i128,
 }
 
 /// A ticket minted for an event.
@@ -264,6 +285,11 @@ pub enum DataKey {
     /// Number of times a ticket has been passed back out for re-entry (issue #78).
     /// Stored apart from `Ticket` so tickets that never re-enter pay no extra cost.
     ReentryCount(u64),
+    /// Number of tickets issued for one of an event's tiers (issue #93).
+    TierIssued(u64, String),
+    /// Optional issuance cap for one of an event's tiers (issue #93). Absent
+    /// means the tier is uncapped.
+    TierCapacity(u64, String),
 }
 
 // Keep the persistent encoding beside the public and stored ticket types.
