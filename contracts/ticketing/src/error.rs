@@ -128,4 +128,6 @@ pub enum Error {
     EventCancelled = 58,
     /// The tier has reached its issuance cap (issue #93).
     TierSoldOut = 59,
+    /// The max uses is zero, or below the number of uses already recorded (issue #74).
+    InvalidMaxUses = 60,
 }

@@ -18,6 +18,11 @@ This project follows [Keep a Changelog](https://keepachangelog.com/).
   for the dependency versioning policy and upgrade procedure.
 
 ### Added
+- Multi-use tickets (passes): `set_ticket_max_uses` sets how many entries a
+  ticket allows (default 1). `check_in` and `check_in_batch` count each entry,
+  and a ticket becomes `Used` only once its uses are exhausted. `pass_out`
+  returns the use its entry consumed. `ticket_max_uses` and
+  `ticket_used_count` read the counters (#74).
 - Event capacity limit: `set_event_capacity` caps the tickets an event may
   issue. `issue_ticket`, `purchase_primary` and `allocate_lottery` reject a
   mint that would exceed it with `SoldOut`; a cap below `tickets_issued` is

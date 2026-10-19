@@ -86,6 +86,7 @@ diagnostic transaction.
 | 55 | `InvalidTicketExpiry` | `set_event_ticket_expiry` was given a time that is not in the future (issue #76) |
 | 56 | `ReentryNotAllowed` | `pass_out` was called on an event with `max_reentries` of zero (issue #78) |
 | 57 | `ReentryLimitReached` | `pass_out` was called after the ticket used all of its re-entries (issue #78) |
+| 60 | `InvalidMaxUses` | `set_ticket_max_uses` was given zero, or a value below the ticket's recorded uses (issue #74) |
 
 ### Grouping
 

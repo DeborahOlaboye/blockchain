@@ -625,6 +625,10 @@ impl TicketingContract {
             return Err(Error::ReentryLimitReached);
         }
         let count = count + 1;
+        // Passing out hands back the use the entry consumed (issue #74), so the
+        // ticket is valid again with the same uses left as before it entered.
+        let used = Self::used_count_of(&env, ticket_id);
+        Self::store_used_count(&env, ticket_id, used.saturating_sub(1));
         ticket.status = TicketStatus::Valid;
         Self::save_ticket(&env, ticket_id, &ticket);
         env.storage().persistent().set(&key, &count);
@@ -641,6 +645,60 @@ impl TicketingContract {
             .persistent()
             .get(&DataKey::ReentryCount(ticket_id))
             .unwrap_or(0)
+    }
+
+    /// Sets how many entries a ticket allows before it is fully used (issue
+    /// #74). Tickets default to one use, which is the single-use behavior.
+    /// Raising the limit on an exhausted ticket makes it valid again.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Revoked` if the ticket is revoked, and
+    /// `Error::InvalidMaxUses` if `max_uses` is zero or below the uses already
+    /// recorded.
+    pub fn set_ticket_max_uses(
+        env: Env,
+        organizer: Address,
+        ticket_id: u64,
+        max_uses: u32,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        let mut ticket = Self::get_ticket_inner(&env, ticket_id)?;
+        Self::require_organizer(&env, ticket.event_id, &organizer)?;
+        if ticket.status == TicketStatus::Revoked {
+            return Err(Error::Revoked);
+        }
+        let used = Self::used_count_of(&env, ticket_id);
+        if max_uses == 0 || max_uses < used {
+            return Err(Error::InvalidMaxUses);
+        }
+        let key = DataKey::MaxUses(ticket_id);
+        env.storage().persistent().set(&key, &max_uses);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        if ticket.status != TicketStatus::Resale {
+            ticket.status = if used >= max_uses {
+                TicketStatus::Used
+            } else {
+                TicketStatus::Valid
+            };
+            Self::save_ticket(&env, ticket_id, &ticket);
+        }
+        Ok(())
+    }
+
+    /// Number of entries a ticket allows before it is fully used (issue #74).
+    /// Defaults to one for tickets that never had a limit set.
+    pub fn ticket_max_uses(env: Env, ticket_id: u64) -> u32 {
+        Self::max_uses_of(&env, ticket_id)
+    }
+
+    /// Number of entries recorded against a ticket (issue #74). Zero for
+    /// tickets that have not been checked in.
+    pub fn ticket_used_count(env: Env, ticket_id: u64) -> u32 {
+        Self::used_count_of(&env, ticket_id)
     }
 
     /// Organizer-authorized issuance for tickets already paid for off-chain
@@ -1192,7 +1250,7 @@ impl TicketingContract {
         if ticket.status == TicketStatus::Resale {
             return Err(Error::ResaleListingActive);
         }
-        ticket.status = TicketStatus::Used;
+        Self::consume_use(&env, ticket_id, &mut ticket);
         ticket.resale_price = 0;
         Self::remove_gift_claim(&env, ticket_id);
         Self::save_ticket(&env, ticket_id, &ticket);
@@ -1232,7 +1290,7 @@ impl TicketingContract {
             if ticket.status == TicketStatus::Resale {
                 return Err(Error::ResaleListingActive);
             }
-            ticket.status = TicketStatus::Used;
+            Self::consume_use(&env, ticket_id, &mut ticket);
             ticket.resale_price = 0;
             Self::remove_gift_claim(&env, ticket_id);
             Self::save_ticket(&env, ticket_id, &ticket);
@@ -1404,6 +1462,12 @@ impl TicketingContract {
         env.storage()
             .persistent()
             .remove(&DataKey::TicketMetadataUri(ticket_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::MaxUses(ticket_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::UsedCount(ticket_id));
         Self::remove_gift_claim(&env, ticket_id);
         Ok(())
     }
@@ -2019,6 +2083,41 @@ impl TicketingContract {
         env.storage()
             .persistent()
             .remove(&DataKey::GiftClaim(ticket_id));
+    }
+
+    fn max_uses_of(env: &Env, ticket_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaxUses(ticket_id))
+            .unwrap_or(1)
+    }
+
+    fn used_count_of(env: &Env, ticket_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UsedCount(ticket_id))
+            .unwrap_or(0)
+    }
+
+    fn store_used_count(env: &Env, ticket_id: u64, count: u32) {
+        let key = DataKey::UsedCount(ticket_id);
+        env.storage().persistent().set(&key, &count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+    }
+
+    /// Records one entry against a ticket's allowed uses (issue #74). The
+    /// ticket becomes `Used` only once its uses are exhausted, so multi-use
+    /// passes stay `Valid` between entries.
+    fn consume_use(env: &Env, ticket_id: u64, ticket: &mut Ticket) {
+        let used = Self::used_count_of(env, ticket_id) + 1;
+        Self::store_used_count(env, ticket_id, used);
+        ticket.status = if used >= Self::max_uses_of(env, ticket_id) {
+            TicketStatus::Used
+        } else {
+            TicketStatus::Valid
+        };
     }
 
     fn transfer_frozen(env: &Env, event: &Event) -> bool {

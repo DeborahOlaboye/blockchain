@@ -26,6 +26,7 @@ mod events;
 mod guards;
 pub mod helpers;
 mod metadata;
+mod multi_use;
 mod organizer_allowlist;
 mod organizer_listing;
 mod owner_index;

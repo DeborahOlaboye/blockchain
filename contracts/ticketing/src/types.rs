@@ -285,6 +285,11 @@ pub enum DataKey {
     /// Number of times a ticket has been passed back out for re-entry (issue #78).
     /// Stored apart from `Ticket` so tickets that never re-enter pay no extra cost.
     ReentryCount(u64),
+    /// Number of entries a ticket allows before it is fully used (issue #74).
+    /// Absent means one use, so single-use tickets pay no extra cost.
+    MaxUses(u64),
+    /// Number of entries recorded against a ticket (issue #74).
+    UsedCount(u64),
     /// Number of tickets issued for one of an event's tiers (issue #93).
     TierIssued(u64, String),
     /// Optional issuance cap for one of an event's tiers (issue #93). Absent
