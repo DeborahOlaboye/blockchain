@@ -432,6 +432,51 @@ fn enable_escrow_rejects_once_tickets_have_been_sold() {
     assert_eq!(result, Err(Ok(Error::EventAlreadyStarted)));
 }
 
+/// Issue #336: `enable_escrow` with a past (or current) release ledger is
+/// rejected.
+///
+/// The escrow release ledger must be strictly in the future
+/// (`escrow_release_ledger > current ledger`, see `enable_escrow` in
+/// `lib.rs` which returns `Error::EventNotEnded` otherwise). A past ledger
+/// would otherwise make `release_escrow` immediately releasable and defeat
+/// the escrow hold.
+#[test]
+fn enable_escrow_rejects_past_release_ledger() {
+    let (env, client, _token, _token_asset, _admin, organizer) = setup();
+    make_event(&env, &client, &organizer, 1);
+
+    // Pin the current ledger so the test does not depend on the default
+    // sequence of the test host.
+    env.ledger().set_sequence_number(500);
+
+    // A release ledger in the past must be rejected.
+    let past = client.try_enable_escrow(&organizer, &1, &499u32);
+    assert_eq!(past, Err(Ok(Error::EventNotEnded)));
+
+    // The boundary is strict: a release ledger equal to the current ledger
+    // is not in the future and must also be rejected.
+    let current = client.try_enable_escrow(&organizer, &1, &500u32);
+    assert_eq!(current, Err(Ok(Error::EventNotEnded)));
+
+    // Rejected calls must not partially enable escrow.
+    let event = client.get_event(&1);
+    assert!(
+        !event.escrow_enabled,
+        "rejected enable_escrow must leave escrow disabled"
+    );
+    assert_eq!(
+        event.escrow_release_ledger, 0,
+        "rejected enable_escrow must not set a release ledger"
+    );
+
+    // A strictly future ledger is accepted, proving the rejection above is
+    // about the ledger and not some other event state.
+    client.enable_escrow(&organizer, &1, &501u32);
+    let event = client.get_event(&1);
+    assert!(event.escrow_enabled);
+    assert_eq!(event.escrow_release_ledger, 501);
+}
+
 #[test]
 fn per_event_payment_token_routes_settlement() {
     let (env, client, _token, _token_asset, _admin, organizer) = setup();
