@@ -40,6 +40,13 @@ pub const MAX_METADATA_URI_LEN: u32 = 256;
 /// (Issue #112). Larger requested pages are clamped to this bound.
 pub const MAX_PAGE_SIZE: u32 = 50;
 
+/// Most zones a tier can be restricted to (issue #80). Bounds the stored list.
+pub const MAX_TIER_ZONES: u32 = 16;
+
+/// Number of previous owners kept per ticket (issue #82). Older owners are
+/// dropped so a frequently traded ticket's history stays a fixed size.
+pub const MAX_OWNER_HISTORY: u32 = 5;
+
 /// Stable lowercase labels for the optional common category vocabulary.
 pub const CATEGORY_CONCERT: &str = "concert";
 pub const CATEGORY_FLIGHT: &str = "flight";
