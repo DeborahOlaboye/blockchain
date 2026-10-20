@@ -141,5 +141,19 @@ pub enum Error {
     /// The sale window ends at or before it starts (issue #94).
     InvalidSaleWindow = 65,
     /// A gift claim already exists for the ticket and has not yet been claimed or expired.
-    GiftClaimAlreadyExists = 61,
+    GiftClaimAlreadyExists = 66,
+    /// The contract is currently paused by the admin.
+    ContractPaused = 67,
+    /// The refund window for this ticket has expired.
+    RefundWindowExpired = 68,
+    /// The ticket has already been refunded.
+    AlreadyRefunded = 69,
+    /// The wallet has reached its purchase limit for this event.
+    PurchaseLimitExceeded = 70,
+    /// The caller is not on the event's allowlist during presale.
+    NotOnAllowlist = 71,
+    /// The presale window has not started yet.
+    PresaleNotStarted = 72,
+    /// The presale window has ended.
+    PresaleEnded = 73,
 }
