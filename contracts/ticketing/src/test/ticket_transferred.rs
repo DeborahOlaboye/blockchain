@@ -5,6 +5,7 @@
 //! contract publishes.
 
 use super::*;
+use soroban_sdk::testutils::Events as _;
 use soroban_sdk::Event as _;
 
 #[test]

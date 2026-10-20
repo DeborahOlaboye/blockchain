@@ -2,7 +2,7 @@
 #![allow(missing_docs)]
 
 use crate::Error;
-use soroban_sdk::{contracttype, Address, BytesN, String};
+use soroban_sdk::{contracttype, Address, BytesN, String, Vec};
 
 /// Optional common category labels for indexers and client applications.
 ///
@@ -134,6 +134,43 @@ pub struct Event {
     pub presale_starts_at: Option<u64>,
     /// Optional presale end timestamp.
     pub presale_ends_at: Option<u64>,
+    /// Maximum number of tickets the event may ever issue (issue #92). `None`
+    /// means uncapped. Compared against `tickets_issued`, so revoked tickets
+    /// still count toward it.
+    pub max_tickets: Option<u64>,
+    /// Seconds before `starts_at` at which check-in opens (issue #95). `None`
+    /// means check-in is open from the start of the event.
+    pub check_in_opens_seconds: Option<u64>,
+    /// Ledger timestamp after which check-in closes (issue #95). `None` means
+    /// check-in never closes.
+    pub ends_at: Option<u64>,
+    /// Ledger timestamp after which tickets can no longer be checked in or
+    /// transferred (issue #76). `None` means tickets never expire.
+    pub ticket_expires_at: Option<u64>,
+    /// How many times a checked-in ticket may be passed back out for re-entry
+    /// (issue #78). `0` disables re-entry for the event.
+    pub max_reentries: u32,
+    /// True once the organizer has cancelled the event (issue #91). A cancelled
+    /// event cannot issue, sell or list tickets.
+    pub cancelled: bool,
+    /// Optional split of `royalty_bps` between several recipients (issue #90).
+    /// Each entry is `(recipient, bps)` and the entries sum to `royalty_bps`.
+    /// `None` pays the whole royalty to the organizer.
+    pub royalty_splits: Option<Vec<(Address, u32)>>,
+}
+
+/// One mint request in a batch issuance (issue #88).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TicketRecipient {
+    /// Account that receives the ticket.
+    pub to: Address,
+    /// Ticket tier name, e.g. "VIP" or "GA".
+    pub tier: String,
+    /// Assigned seat, or "unassigned" for general admission.
+    pub seat: String,
+    /// Price paid at primary sale; used for resale caps and refunds.
+    pub price: i128,
 }
 
 /// A ticket minted for an event.
@@ -267,6 +304,32 @@ pub enum DataKey {
     /// Position of a ticket inside its owner's index, so a transfer or burn can
     /// remove it in constant time (issue #111).
     TicketOwnerPos(u64),
+    /// Number of times a ticket has been passed back out for re-entry (issue #78).
+    /// Stored apart from `Ticket` so tickets that never re-enter pay no extra cost.
+    ReentryCount(u64),
+    /// Number of entries a ticket allows before it is fully used (issue #74).
+    /// Absent means one use, so single-use tickets pay no extra cost.
+    MaxUses(u64),
+    /// Number of entries recorded against a ticket (issue #74).
+    UsedCount(u64),
+    /// Number of tickets issued for one of an event's tiers (issue #93).
+    TierIssued(u64, String),
+    /// Optional issuance cap for one of an event's tiers (issue #93). Absent
+    /// means the tier is uncapped.
+    TierCapacity(u64, String),
+    /// Zones/gates a tier may enter, keyed by event id and tier (issue #80).
+    /// Absent means the tier is unrestricted.
+    TierZones(u64, String),
+    /// Previous owners of a ticket, oldest first, capped at
+    /// `MAX_OWNER_HISTORY` (issue #82). Absent until the first transfer.
+    OwnerHistory(u64),
+    /// Optional primary sale window `(sale_start, sale_end)` for an event, in
+    /// ledger seconds (issue #94). Stored apart from `Event` so setting it
+    /// never rewrites the event record and old records stay readable.
+    SaleWindow(u64),
+    /// Presence marks an address allowed to check tickets in for an event on
+    /// the organizer's behalf, e.g. a gate device (issue #89).
+    CheckInSigner(u64, Address),
     /// Contract paused status.
     Paused,
     /// Number of tickets purchased by a wallet for an event.

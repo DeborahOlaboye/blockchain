@@ -107,18 +107,53 @@ pub enum Error {
     TicketNotUsed = 48,
     /// The used ticket's retention period has not elapsed yet (issue #113).
     RetentionPeriodNotElapsed = 49,
+    /// The event has reached its maximum ticket count (issue #92).
+    SoldOut = 50,
+    /// The capacity is below the number of tickets already issued (issue #92).
+    InvalidCapacity = 51,
+    /// Check-in is outside the event's configured window (issue #95).
+    CheckInWindowClosed = 52,
+    /// The check-in window is invalid, e.g. it ends before the event starts (issue #95).
+    InvalidCheckInWindow = 53,
+    /// The ticket has passed its expiry time (issue #76).
+    TicketExpired = 54,
+    /// The ticket expiry is not in the future (issue #76).
+    InvalidTicketExpiry = 55,
+    /// The event does not allow re-entry, or the ticket is not checked in (issue #78).
+    ReentryNotAllowed = 56,
+    /// The ticket has used all of its allowed re-entries (issue #78).
+    ReentryLimitReached = 57,
+    /// The event has been cancelled by its organizer, so it can no longer
+    /// issue, sell or list tickets, and cannot be cancelled again (issue #91).
+    EventCancelled = 58,
+    /// The tier has reached its issuance cap (issue #93).
+    TierSoldOut = 59,
+    /// The max uses is zero, or below the number of uses already recorded (issue #74).
+    InvalidMaxUses = 60,
+    /// The ticket's tier may not enter the zone being checked in at (issue #80).
+    ZoneNotAllowed = 61,
+    /// Too many zones, or a zone label is empty or too long (issue #80).
+    InvalidZones = 62,
+    /// The primary sale has not opened yet (issue #94).
+    SaleNotStarted = 63,
+    /// The primary sale has closed (issue #94).
+    SaleEnded = 64,
+    /// The sale window ends at or before it starts (issue #94).
+    InvalidSaleWindow = 65,
+    /// A gift claim already exists for the ticket and has not yet been claimed or expired.
+    GiftClaimAlreadyExists = 66,
     /// The contract is currently paused by the admin.
-    ContractPaused = 50,
+    ContractPaused = 67,
     /// The refund window for this ticket has expired.
-    RefundWindowExpired = 51,
+    RefundWindowExpired = 68,
     /// The ticket has already been refunded.
-    AlreadyRefunded = 52,
+    AlreadyRefunded = 69,
     /// The wallet has reached its purchase limit for this event.
-    PurchaseLimitExceeded = 53,
+    PurchaseLimitExceeded = 70,
     /// The caller is not on the event's allowlist during presale.
-    NotOnAllowlist = 54,
+    NotOnAllowlist = 71,
     /// The presale window has not started yet.
-    PresaleNotStarted = 55,
+    PresaleNotStarted = 72,
     /// The presale window has ended.
-    PresaleEnded = 56,
+    PresaleEnded = 73,
 }

@@ -11,18 +11,18 @@ mod types;
 pub use constants::{
     BPS_DENOMINATOR, CATEGORY_CONCERT, CATEGORY_CONFERENCE, CATEGORY_FESTIVAL, CATEGORY_FLIGHT,
     CATEGORY_OTHER, CATEGORY_SPORTS, MAX_BATCH_SIZE, MAX_CATEGORY_LEN, MAX_METADATA_URI_LEN,
-    MAX_NAME_LEN, MAX_PAGE_SIZE, MAX_TICKET_LABEL_LEN, PAYMENT_TOKEN_CHANGE_DELAY_LEDGERS,
-    USED_TICKET_RETENTION_SECONDS,
+    MAX_NAME_LEN, MAX_OWNER_HISTORY, MAX_PAGE_SIZE, MAX_TICKET_LABEL_LEN, MAX_TIER_ZONES,
+    PAYMENT_TOKEN_CHANGE_DELAY_LEDGERS, USED_TICKET_RETENTION_SECONDS,
 };
 use constants::{LEDGER_BUMP, LEDGER_THRESHOLD};
 pub use error::Error;
 pub use events::{
-    ContractInitialized, OrganizerApproved, OrganizerRevoked, PaymentTokenChanged,
+    ContractInitialized, EventCancelled, OrganizerApproved, OrganizerRevoked, PaymentTokenChanged,
     PaymentTokenProposed, PurchaseThrottleUpdated, TicketCheckedIn, TicketIssued, TicketTransferred,
 };
 pub use types::{
     Category, DataKey, Event, EventParams, GiftClaim, PendingPaymentToken, StoredTicket, Ticket,
-    TicketStatus,
+    TicketRecipient, TicketStatus,
 };
 
 use soroban_sdk::{contract, contractimpl, token, Address, Bytes, BytesN, Env, String, Vec};
@@ -312,6 +312,13 @@ impl TicketingContract {
             refund_window_seconds: params.refund_window_seconds,
             presale_starts_at: params.presale_starts_at,
             presale_ends_at: params.presale_ends_at,
+            max_tickets: None,
+            check_in_opens_seconds: None,
+            ends_at: None,
+            ticket_expires_at: None,
+            max_reentries: 0,
+            cancelled: false,
+            royalty_splits: None,
         };
         Self::save_event(&env, event_id, &event);
         env.storage()
@@ -351,7 +358,10 @@ impl TicketingContract {
                 }
             }
         }
-        Self::require_organizer(&env, event_id, &organizer)?;
+        let event = Self::require_organizer(&env, event_id, &organizer)?;
+        Self::ensure_not_cancelled(&event)?;
+        Self::ensure_capacity(&event, winner_count as u64)?;
+        Self::reserve_tier_capacity(&env, event_id, &tier, winner_count as u64)?;
 
         env.prng().shuffle(&mut entrants);
         let mut ticket_ids = Vec::new(&env);
@@ -458,6 +468,254 @@ impl TicketingContract {
         Ok(())
     }
 
+    /// Cancels an event (issue #91). A cancelled event rejects new issuance,
+    /// primary sales and resale listings. Tickets already issued are left
+    /// untouched, so existing holders keep their tickets.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::EventCancelled` if the event is already cancelled.
+    pub fn cancel_event(env: Env, organizer: Address, event_id: u64) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        let mut event = Self::require_organizer(&env, event_id, &organizer)?;
+        if event.cancelled {
+            return Err(Error::EventCancelled);
+        }
+        event.cancelled = true;
+        Self::save_event(&env, event_id, &event);
+        EventCancelled {
+            event_id,
+            organizer,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Splits the event's resale royalty between several recipients (issue
+    /// #90). Each entry is `(recipient, bps)` and the entries must sum to the
+    /// event's `royalty_bps`. `None` restores the default of paying the whole
+    /// royalty to the organizer. Applies to resales settled after the change.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidRoyalty` when the splits are empty or do not sum
+    /// to `royalty_bps`.
+    pub fn set_royalty_splits(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        splits: Option<Vec<(Address, u32)>>,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        let mut event = Self::require_organizer(&env, event_id, &organizer)?;
+        if let Some(entries) = &splits {
+            if entries.is_empty() {
+                return Err(Error::InvalidRoyalty);
+            }
+            let mut total: u64 = 0;
+            for (_, bps) in entries.iter() {
+                total += bps as u64;
+            }
+            if total != event.royalty_bps as u64 {
+                return Err(Error::InvalidRoyalty);
+            }
+        }
+        event.royalty_splits = splits;
+        Self::save_event(&env, event_id, &event);
+        Ok(())
+    }
+
+    /// Caps how many tickets an event may ever issue (issue #92). `None`
+    /// removes the cap. The cap cannot be set below `tickets_issued`, since
+    /// those tickets already exist.
+    pub fn set_event_capacity(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        max_tickets: Option<u64>,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        let mut event = Self::require_organizer(&env, event_id, &organizer)?;
+        if let Some(max) = max_tickets {
+            if max == 0 || max < event.tickets_issued {
+                return Err(Error::InvalidCapacity);
+            }
+        }
+        event.max_tickets = max_tickets;
+        Self::save_event(&env, event_id, &event);
+        Ok(())
+    }
+
+    /// Configures the check-in window (issue #95). Check-in opens
+    /// `check_in_opens_seconds` before `starts_at` (`None` opens it from the
+    /// start of the event) and closes at `ends_at` (`None` never closes).
+    /// `ends_at` must fall after `starts_at`.
+    pub fn set_event_check_in_window(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        check_in_opens_seconds: Option<u64>,
+        ends_at: Option<u64>,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        let mut event = Self::require_organizer(&env, event_id, &organizer)?;
+        if let Some(end) = ends_at {
+            if end <= event.starts_at {
+                return Err(Error::InvalidCheckInWindow);
+            }
+        }
+        event.check_in_opens_seconds = check_in_opens_seconds;
+        event.ends_at = ends_at;
+        Self::save_event(&env, event_id, &event);
+        Ok(())
+    }
+
+    /// Sets when the event's tickets expire (issue #76). Expired tickets can
+    /// no longer be checked in or transferred. `None` removes the expiry. The
+    /// expiry must be in the future when set.
+    pub fn set_event_ticket_expiry(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        expires_at: Option<u64>,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        let mut event = Self::require_organizer(&env, event_id, &organizer)?;
+        if let Some(expires) = expires_at {
+            if expires <= env.ledger().timestamp() {
+                return Err(Error::InvalidTicketExpiry);
+            }
+        }
+        event.ticket_expires_at = expires_at;
+        Self::save_event(&env, event_id, &event);
+        Ok(())
+    }
+
+    /// Sets how many times a checked-in ticket may re-enter the venue (issue
+    /// #78). `0` disables re-entry for the event.
+    pub fn set_event_max_reentries(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        max_reentries: u32,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        let mut event = Self::require_organizer(&env, event_id, &organizer)?;
+        event.max_reentries = max_reentries;
+        Self::save_event(&env, event_id, &event);
+        Ok(())
+    }
+
+    /// Passes a checked-in ticket back out so it can be checked in again
+    /// (issue #78). Only the event's organizer may do this, and only when the
+    /// event allows re-entry and the ticket has not used all of its
+    /// re-entries. Returns the ticket's re-entry count after this pass-out.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::TicketNotUsed` if the ticket is not checked in,
+    /// `Error::ReentryNotAllowed` if the event disables re-entry, and
+    /// `Error::ReentryLimitReached` once the ticket has used all of its
+    /// re-entries.
+    pub fn pass_out(env: Env, organizer: Address, ticket_id: u64) -> Result<u32, Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        let mut ticket = Self::get_ticket_inner(&env, ticket_id)?;
+        let event = Self::require_organizer(&env, ticket.event_id, &organizer)?;
+        if ticket.status != TicketStatus::Used {
+            return Err(Error::TicketNotUsed);
+        }
+        if event.max_reentries == 0 {
+            return Err(Error::ReentryNotAllowed);
+        }
+        let key = DataKey::ReentryCount(ticket_id);
+        let count: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        if count >= event.max_reentries {
+            return Err(Error::ReentryLimitReached);
+        }
+        let count = count + 1;
+        // Passing out hands back the use the entry consumed (issue #74), so the
+        // ticket is valid again with the same uses left as before it entered.
+        let used = Self::used_count_of(&env, ticket_id);
+        Self::store_used_count(&env, ticket_id, used.saturating_sub(1));
+        ticket.status = TicketStatus::Valid;
+        Self::save_ticket(&env, ticket_id, &ticket);
+        env.storage().persistent().set(&key, &count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        Ok(count)
+    }
+
+    /// Number of times a ticket has been passed back out for re-entry
+    /// (issue #78). Zero for tickets that never re-entered.
+    pub fn reentry_count(env: Env, ticket_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReentryCount(ticket_id))
+            .unwrap_or(0)
+    }
+
+    /// Sets how many entries a ticket allows before it is fully used (issue
+    /// #74). Tickets default to one use, which is the single-use behavior.
+    /// Raising the limit on an exhausted ticket makes it valid again.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Revoked` if the ticket is revoked, and
+    /// `Error::InvalidMaxUses` if `max_uses` is zero or below the uses already
+    /// recorded.
+    pub fn set_ticket_max_uses(
+        env: Env,
+        organizer: Address,
+        ticket_id: u64,
+        max_uses: u32,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        let mut ticket = Self::get_ticket_inner(&env, ticket_id)?;
+        Self::require_organizer(&env, ticket.event_id, &organizer)?;
+        if ticket.status == TicketStatus::Revoked {
+            return Err(Error::Revoked);
+        }
+        let used = Self::used_count_of(&env, ticket_id);
+        if max_uses == 0 || max_uses < used {
+            return Err(Error::InvalidMaxUses);
+        }
+        let key = DataKey::MaxUses(ticket_id);
+        env.storage().persistent().set(&key, &max_uses);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        if ticket.status != TicketStatus::Resale {
+            ticket.status = if used >= max_uses {
+                TicketStatus::Used
+            } else {
+                TicketStatus::Valid
+            };
+            Self::save_ticket(&env, ticket_id, &ticket);
+        }
+        Ok(())
+    }
+
+    /// Number of entries a ticket allows before it is fully used (issue #74).
+    /// Defaults to one for tickets that never had a limit set.
+    pub fn ticket_max_uses(env: Env, ticket_id: u64) -> u32 {
+        Self::max_uses_of(&env, ticket_id)
+    }
+
+    /// Number of entries recorded against a ticket (issue #74). Zero for
+    /// tickets that have not been checked in.
+    pub fn ticket_used_count(env: Env, ticket_id: u64) -> u32 {
+        Self::used_count_of(&env, ticket_id)
+    }
+
     /// Organizer-authorized issuance for tickets already paid for off-chain
     /// (card payment, comp, or fiat-to-crypto settled by the platform).
     /// Increments the event's monotonic `tickets_issued` counter by 1.
@@ -501,13 +759,68 @@ impl TicketingContract {
         if let Some(uri) = &metadata_uri {
             Self::validate_label(uri, MAX_METADATA_URI_LEN)?;
         }
-        Self::require_organizer(&env, event_id, &organizer)?;
+        let event = Self::require_organizer(&env, event_id, &organizer)?;
+        Self::ensure_not_cancelled(&event)?;
+        Self::ensure_capacity(&event, 1)?;
+        Self::reserve_tier_capacity(&env, event_id, &tier, 1)?;
         let ticket_id = Self::mint(&env, event_id, to, tier, seat, price);
         if let Some(uri) = &metadata_uri {
             Self::store_metadata_uri(&env, ticket_id, uri);
         }
         Self::increment_tickets_issued(&env, event_id, 1);
         Ok(ticket_id)
+    }
+
+    /// Mints many tickets for one event in a single call (issue #88). Every
+    /// recipient goes through the same mint helper as `issue_ticket`, so each
+    /// one emits its own `TicketIssued` event. Returns the new ticket ids in
+    /// the same order as `recipients`.
+    ///
+    /// Bounded by `MAX_BATCH_SIZE` and atomic: if any recipient fails
+    /// validation, no ticket from this call is minted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::EmptyBatch` for an empty list, `Error::BatchTooLarge`
+    /// above `MAX_BATCH_SIZE`, and `Error::SoldOut` or `Error::TierSoldOut`
+    /// when the batch would exceed the event or tier cap.
+    pub fn issue_tickets(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        recipients: Vec<TicketRecipient>,
+    ) -> Result<Vec<u64>, Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        Self::require_initialized(&env)?;
+        if recipients.is_empty() {
+            return Err(Error::EmptyBatch);
+        }
+        if recipients.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        let event = Self::require_organizer(&env, event_id, &organizer)?;
+        Self::ensure_not_cancelled(&event)?;
+        Self::ensure_capacity(&event, recipients.len() as u64)?;
+        let mut ticket_ids = Vec::new(&env);
+        for recipient in recipients.iter() {
+            if recipient.price < 0 {
+                return Err(Error::InvalidPrice);
+            }
+            Self::validate_ticket_labels(&recipient.tier, &recipient.seat)?;
+            Self::reserve_tier_capacity(&env, event_id, &recipient.tier, 1)?;
+            let ticket_id = Self::mint(
+                &env,
+                event_id,
+                recipient.to,
+                recipient.tier,
+                recipient.seat,
+                recipient.price,
+            );
+            ticket_ids.push_back(ticket_id);
+        }
+        Self::increment_tickets_issued(&env, event_id, recipients.len() as u64);
+        Ok(ticket_ids)
     }
 
     /// Sets the organizer's primary sale price for one of an event's tiers
@@ -546,6 +859,43 @@ impl TicketingContract {
         Self::tier_price(&env, event_id, &tier)
     }
 
+    /// Caps how many tickets one of an event's tiers may ever issue (issue
+    /// #93). `None` removes the cap. Every mint path counts toward the tier
+    /// whether or not a cap is set, so the cap can be added at any time, but
+    /// it cannot be set below the number of tickets already issued in the tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidCapacity` for a zero cap or one below the tier's
+    /// issued count.
+    pub fn set_tier_capacity(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        tier: String,
+        cap: Option<u64>,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        Self::require_organizer(&env, event_id, &organizer)?;
+        Self::validate_label(&tier, MAX_TICKET_LABEL_LEN)?;
+        let key = DataKey::TierCapacity(event_id, tier.clone());
+        match cap {
+            Some(max) => {
+                let issued = Self::tier_issued(&env, event_id, &tier);
+                if max == 0 || max < issued {
+                    return Err(Error::InvalidCapacity);
+                }
+                env.storage().persistent().set(&key, &max);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+            }
+            None => env.storage().persistent().remove(&key),
+        }
+        Ok(())
+    }
+
     /// Internal lookup of an event's tier price, also extending the entry's
     /// TTL so a live sale never expires mid-transaction.
     fn tier_price(env: &Env, event_id: u64, tier: &String) -> Result<i128, Error> {
@@ -582,9 +932,13 @@ impl TicketingContract {
         Self::validate_ticket_labels(&tier, &seat)?;
         Self::enforce_purchase_throttle(&env, &buyer)?;
         let mut event = Self::get_event_inner(&env, event_id)?;
+        Self::ensure_not_cancelled(&event)?;
+        Self::ensure_sale_open(&env, event_id)?;
         Self::enforce_presale_rules(&env, event_id, &buyer, &event)?;
         Self::enforce_wallet_limit(&env, event_id, &buyer, &event)?;
+        Self::ensure_capacity(&event, 1)?;
         let price = Self::tier_price(&env, event_id, &tier)?;
+        Self::reserve_tier_capacity(&env, event_id, &tier, 1)?;
         let token_client = token::Client::new(&env, &Self::payment_token_for_event(&env, &event)?);
         if price > 0 {
             if event.escrow_enabled {
@@ -693,7 +1047,7 @@ impl TicketingContract {
         Self::require_not_terminal(&ticket)?;
         let event = Self::get_event_inner(&env, ticket.event_id)?;
         Self::ensure_transferable(&event)?;
-        Self::ensure_transfer_allowed(&ticket, &event)?;
+        Self::ensure_transfer_allowed(&env, &ticket, &event)?;
         if Self::transfer_frozen(&env, &event) {
             return Err(Error::TransfersFrozen);
         }
@@ -743,7 +1097,7 @@ impl TicketingContract {
                 return Err(Error::TransfersFrozen);
             }
             Self::ensure_transferable(&event)?;
-            Self::ensure_transfer_allowed(&ticket, &event)?;
+            Self::ensure_transfer_allowed(&env, &ticket, &event)?;
             Self::move_owner_balance(&env, ticket_id, &ticket.owner, &to);
             ticket.owner = to.clone();
             ticket.transfers += 1;
@@ -771,6 +1125,11 @@ impl TicketingContract {
             return Err(Error::InvalidExpiry);
         }
 
+        let key = DataKey::GiftClaim(ticket_id);
+        if env.storage().persistent().has(&key) {
+            return Err(Error::GiftClaimAlreadyExists);
+        }
+
         let mut ticket = Self::get_ticket_inner(&env, ticket_id)?;
         if ticket.owner != owner {
             return Err(Error::NotOwner);
@@ -789,7 +1148,6 @@ impl TicketingContract {
             secret_hash,
             expires_at,
         };
-        let key = DataKey::GiftClaim(ticket_id);
         env.storage().persistent().set(&key, &claim);
         env.storage()
             .persistent()
@@ -832,7 +1190,7 @@ impl TicketingContract {
             return Err(Error::TransfersFrozen);
         }
         Self::ensure_transferable(&event)?;
-        Self::ensure_transfer_allowed(&ticket, &event)?;
+        Self::ensure_transfer_allowed(&env, &ticket, &event)?;
 
         Self::move_owner_balance(&env, ticket_id, &ticket.owner, &recipient);
         ticket.owner = recipient;
@@ -909,22 +1267,158 @@ impl TicketingContract {
         Self::extend_instance_ttl(&env);
         organizer.require_auth();
         Self::require_not_paused(&env)?;
-        let mut ticket = Self::get_ticket_inner(&env, ticket_id)?;
-        Self::require_organizer(&env, ticket.event_id, &organizer)?;
-        Self::require_not_terminal(&ticket)?;
-        if ticket.status == TicketStatus::Resale {
-            return Err(Error::ResaleListingActive);
+        Self::do_check_in(&env, &organizer, ticket_id, None)
+    }
+
+    /// Checks a ticket in at a specific zone or gate (issue #80). Fails with
+    /// `Error::ZoneNotAllowed` when the ticket's tier is restricted to other
+    /// zones; tiers with no zone list may enter anywhere. `signer` is the
+    /// organizer or one of the event's check-in signers (issue #89).
+    pub fn check_in_at_zone(
+        env: Env,
+        signer: Address,
+        ticket_id: u64,
+        zone: String,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        signer.require_auth();
+        Self::require_not_paused(&env)?;
+        Self::do_check_in(&env, &signer, ticket_id, Some(zone))
+    }
+
+    /// Restricts a tier to a set of zones/gates (issue #80). An empty list
+    /// removes the restriction. At most `MAX_TIER_ZONES` labels, each
+    /// non-empty and at most `MAX_TICKET_LABEL_LEN` bytes.
+    pub fn set_tier_zones(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        tier: String,
+        zones: Vec<String>,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        Self::require_not_paused(&env)?;
+        Self::require_organizer(&env, event_id, &organizer)?;
+        Self::validate_label(&tier, MAX_TICKET_LABEL_LEN)?;
+        if zones.len() > MAX_TIER_ZONES {
+            return Err(Error::InvalidZones);
         }
-        ticket.status = TicketStatus::Used;
-        ticket.resale_price = 0;
-        Self::remove_gift_claim(&env, ticket_id);
-        Self::save_ticket(&env, ticket_id, &ticket);
-        TicketCheckedIn {
-            ticket_id,
-            organizer,
+        for zone in zones.iter() {
+            if zone.is_empty() || zone.len() > MAX_TICKET_LABEL_LEN {
+                return Err(Error::InvalidZones);
+            }
         }
-        .publish(&env);
+        let key = DataKey::TierZones(event_id, tier);
+        if zones.is_empty() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &zones);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        }
         Ok(())
+    }
+
+    /// Zones a tier may enter; empty when the tier is unrestricted (issue #80).
+    pub fn tier_zones(env: Env, event_id: u64, tier: String) -> Vec<String> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TierZones(event_id, tier))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Lets `signer` (e.g. a gate device key) check tickets in for the event,
+    /// so gates don't need the organizer's master key (issue #89).
+    pub fn add_checkin_signer(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        signer: Address,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        Self::require_organizer(&env, event_id, &organizer)?;
+        let key = DataKey::CheckInSigner(event_id, signer);
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        Ok(())
+    }
+
+    /// Revokes a delegated check-in signer (issue #89).
+    pub fn remove_checkin_signer(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        signer: Address,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        Self::require_organizer(&env, event_id, &organizer)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CheckInSigner(event_id, signer));
+        Ok(())
+    }
+
+    /// Whether `signer` is a delegated check-in signer for the event (issue #89).
+    pub fn is_checkin_signer(env: Env, event_id: u64, signer: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::CheckInSigner(event_id, signer))
+    }
+
+    /// Sets the primary sale window in ledger seconds (issue #94).
+    /// `purchase_primary` fails with `SaleNotStarted` before `sale_start` and
+    /// `SaleEnded` from `sale_end` on. `None` leaves that side open; passing
+    /// `None` for both removes the window.
+    pub fn set_event_sale_window(
+        env: Env,
+        organizer: Address,
+        event_id: u64,
+        sale_start: Option<u64>,
+        sale_end: Option<u64>,
+    ) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
+        organizer.require_auth();
+        Self::require_organizer(&env, event_id, &organizer)?;
+        if let (Some(start), Some(end)) = (sale_start, sale_end) {
+            if end <= start {
+                return Err(Error::InvalidSaleWindow);
+            }
+        }
+        let key = DataKey::SaleWindow(event_id);
+        if sale_start.is_none() && sale_end.is_none() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&key, &(sale_start, sale_end));
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        }
+        Ok(())
+    }
+
+    /// The event's primary sale window `(sale_start, sale_end)` (issue #94).
+    pub fn sale_window(env: Env, event_id: u64) -> (Option<u64>, Option<u64>) {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SaleWindow(event_id))
+            .unwrap_or((None, None))
+    }
+
+    /// Previous owners of a ticket, oldest first, keeping the last
+    /// `MAX_OWNER_HISTORY` (issue #82). The current owner is not included.
+    pub fn owner_history(env: Env, ticket_id: u64) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OwnerHistory(ticket_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Marks a batch of tickets as used at the point of entry for group admission.
@@ -949,12 +1443,14 @@ impl TicketingContract {
         }
         for ticket_id in ticket_ids.iter() {
             let mut ticket = Self::get_ticket_inner(&env, ticket_id)?;
-            Self::require_organizer(&env, ticket.event_id, &organizer)?;
+            let event = Self::require_check_in_authority(&env, ticket.event_id, &organizer)?;
+            Self::ensure_check_in_window(&env, &event)?;
+            Self::ensure_not_expired(&env, &event)?;
             Self::require_not_terminal(&ticket)?;
             if ticket.status == TicketStatus::Resale {
                 return Err(Error::ResaleListingActive);
             }
-            ticket.status = TicketStatus::Used;
+            Self::consume_use(&env, ticket_id, &mut ticket);
             ticket.resale_price = 0;
             Self::remove_gift_claim(&env, ticket_id);
             Self::save_ticket(&env, ticket_id, &ticket);
@@ -1130,6 +1626,12 @@ impl TicketingContract {
         env.storage()
             .persistent()
             .remove(&DataKey::TicketMetadataUri(ticket_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::MaxUses(ticket_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::UsedCount(ticket_id));
         Self::remove_gift_claim(&env, ticket_id);
         Ok(())
     }
@@ -1157,6 +1659,7 @@ impl TicketingContract {
         }
         Self::require_not_terminal(&ticket)?;
         let event = Self::get_event_inner(&env, ticket.event_id)?;
+        Self::ensure_not_cancelled(&event)?;
         Self::ensure_transferable(&event)?;
         if Self::resale_closed(&env, &event) {
             return Err(Error::ResaleClosed);
@@ -1296,7 +1799,7 @@ impl TicketingContract {
             return Err(Error::ResaleClosed);
         }
         Self::ensure_transferable(&event)?;
-        Self::ensure_transfer_allowed(&ticket, &event)?;
+        Self::ensure_transfer_allowed(&env, &ticket, &event)?;
         let token_address = Self::payment_token_for_event(&env, &event)?;
 
         // --- effects: settle state before any untrusted external call. ---
@@ -1318,7 +1821,7 @@ impl TicketingContract {
         // --- interactions: the only untrusted calls, after state is final.
         let token_client = token::Client::new(&env, &token_address);
         if royalty > 0 {
-            token_client.transfer(&buyer, &event.organizer, &royalty);
+            Self::pay_royalty(&token_client, &buyer, &event, royalty)?;
         }
         if seller_amount > 0 {
             token_client.transfer(&buyer, &seller, &seller_amount);
@@ -1539,6 +2042,115 @@ impl TicketingContract {
 
     /// Loads an event and verifies its organizer after the caller has
     /// required authorization at the entry point.
+    /// Shared body of `check_in` / `check_in_at_zone`. Callers have already
+    /// required `signer`'s auth.
+    fn do_check_in(
+        env: &Env,
+        signer: &Address,
+        ticket_id: u64,
+        zone: Option<String>,
+    ) -> Result<(), Error> {
+        let mut ticket = Self::get_ticket_inner(env, ticket_id)?;
+        let event = Self::require_check_in_authority(env, ticket.event_id, signer)?;
+        Self::ensure_check_in_window(env, &event)?;
+        Self::ensure_not_expired(env, &event)?;
+        Self::require_not_terminal(&ticket)?;
+        if ticket.status == TicketStatus::Resale {
+            return Err(Error::ResaleListingActive);
+        }
+        if let Some(zone) = zone {
+            Self::ensure_zone_allowed(env, ticket.event_id, &ticket.tier, &zone)?;
+        }
+        Self::consume_use(env, ticket_id, &mut ticket);
+        ticket.resale_price = 0;
+        Self::remove_gift_claim(env, ticket_id);
+        Self::save_ticket(env, ticket_id, &ticket);
+        TicketCheckedIn {
+            ticket_id,
+            organizer: signer.clone(),
+        }
+        .publish(env);
+        Ok(())
+    }
+
+    /// The organizer, or a delegated check-in signer for the event (issue
+    /// #89). Anyone else gets `Error::NotOrganizer`.
+    fn require_check_in_authority(
+        env: &Env,
+        event_id: u64,
+        signer: &Address,
+    ) -> Result<Event, Error> {
+        let event = Self::get_event_inner(env, event_id)?;
+        if event.organizer == *signer
+            || env
+                .storage()
+                .persistent()
+                .has(&DataKey::CheckInSigner(event_id, signer.clone()))
+        {
+            return Ok(event);
+        }
+        Err(Error::NotOrganizer)
+    }
+
+    /// Tiers with no zone list may enter anywhere (issue #80).
+    fn ensure_zone_allowed(
+        env: &Env,
+        event_id: u64,
+        tier: &String,
+        zone: &String,
+    ) -> Result<(), Error> {
+        let zones: Option<Vec<String>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TierZones(event_id, tier.clone()));
+        match zones {
+            Some(zones) if !zones.contains(zone) => Err(Error::ZoneNotAllowed),
+            _ => Ok(()),
+        }
+    }
+
+    /// Enforces the optional primary sale window (issue #94).
+    fn ensure_sale_open(env: &Env, event_id: u64) -> Result<(), Error> {
+        let window: Option<(Option<u64>, Option<u64>)> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SaleWindow(event_id));
+        let Some((start, end)) = window else {
+            return Ok(());
+        };
+        let now = env.ledger().timestamp();
+        if let Some(start) = start {
+            if now < start {
+                return Err(Error::SaleNotStarted);
+            }
+        }
+        if let Some(end) = end {
+            if now >= end {
+                return Err(Error::SaleEnded);
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends `previous` to a ticket's bounded owner history (issue #82),
+    /// dropping the oldest entry once `MAX_OWNER_HISTORY` is reached.
+    fn record_previous_owner(env: &Env, ticket_id: u64, previous: &Address) {
+        let key = DataKey::OwnerHistory(ticket_id);
+        let mut history: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        while history.len() >= MAX_OWNER_HISTORY {
+            history.pop_front();
+        }
+        history.push_back(previous.clone());
+        env.storage().persistent().set(&key, &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+    }
+
     fn require_organizer(env: &Env, event_id: u64, organizer: &Address) -> Result<Event, Error> {
         let event = Self::get_event_inner(env, event_id)?;
         if event.organizer != *organizer {
@@ -1623,6 +2235,7 @@ impl TicketingContract {
     /// Records one ticket leaving `from` and one arriving at `to` (issue
     /// #110). Callers pass the owner as it stood before the change.
     fn move_owner_balance(env: &Env, ticket_id: u64, from: &Address, to: &Address) {
+        Self::record_previous_owner(env, ticket_id, from);
         Self::debit_owner_balance(env, from);
         Self::credit_owner_balance(env, to);
         Self::remove_from_owner_index(env, from, ticket_id);
@@ -1749,6 +2362,41 @@ impl TicketingContract {
             .remove(&DataKey::GiftClaim(ticket_id));
     }
 
+    fn max_uses_of(env: &Env, ticket_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaxUses(ticket_id))
+            .unwrap_or(1)
+    }
+
+    fn used_count_of(env: &Env, ticket_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UsedCount(ticket_id))
+            .unwrap_or(0)
+    }
+
+    fn store_used_count(env: &Env, ticket_id: u64, count: u32) {
+        let key = DataKey::UsedCount(ticket_id);
+        env.storage().persistent().set(&key, &count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+    }
+
+    /// Records one entry against a ticket's allowed uses (issue #74). The
+    /// ticket becomes `Used` only once its uses are exhausted, so multi-use
+    /// passes stay `Valid` between entries.
+    fn consume_use(env: &Env, ticket_id: u64, ticket: &mut Ticket) {
+        let used = Self::used_count_of(env, ticket_id) + 1;
+        Self::store_used_count(env, ticket_id, used);
+        ticket.status = if used >= Self::max_uses_of(env, ticket_id) {
+            TicketStatus::Used
+        } else {
+            TicketStatus::Valid
+        };
+    }
+
     fn transfer_frozen(env: &Env, event: &Event) -> bool {
         env.ledger().timestamp()
             >= event
@@ -1760,13 +2408,126 @@ impl TicketingContract {
         env.ledger().timestamp() >= event.starts_at.saturating_sub(event.resale_cutoff_seconds)
     }
 
-    fn ensure_transfer_allowed(ticket: &Ticket, event: &Event) -> Result<(), Error> {
+    fn ensure_transfer_allowed(env: &Env, ticket: &Ticket, event: &Event) -> Result<(), Error> {
         if let Some(max_transfers) = event.max_transfers_per_ticket {
             if ticket.transfers >= max_transfers {
                 return Err(Error::TransferLimitExceeded);
             }
         }
+        Self::ensure_not_expired(env, event)
+    }
+
+    /// Rejects a primary mint once the event has reached its `max_tickets`
+    /// cap (issue #92). `amount` is how many tickets the caller is about to
+    /// mint, so a batch lottery is checked as a whole.
+    fn ensure_capacity(event: &Event, amount: u64) -> Result<(), Error> {
+        match event.max_tickets {
+            Some(max) if event.tickets_issued.saturating_add(amount) > max => Err(Error::SoldOut),
+            _ => Ok(()),
+        }
+    }
+
+    /// Rejects every new issuance, sale or listing once the organizer has
+    /// cancelled the event (issue #91).
+    fn ensure_not_cancelled(event: &Event) -> Result<(), Error> {
+        if event.cancelled {
+            return Err(Error::EventCancelled);
+        }
         Ok(())
+    }
+
+    /// Number of tickets issued so far in one of an event's tiers (issue #93).
+    fn tier_issued(env: &Env, event_id: u64, tier: &String) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TierIssued(event_id, tier.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Counts `amount` more tickets against a tier and rejects the mint when
+    /// the tier's cap would be exceeded (issue #93). Every mint path calls
+    /// this, so tiers are tracked even when no cap is set.
+    fn reserve_tier_capacity(
+        env: &Env,
+        event_id: u64,
+        tier: &String,
+        amount: u64,
+    ) -> Result<(), Error> {
+        let next = Self::tier_issued(env, event_id, tier).saturating_add(amount);
+        let cap_key = DataKey::TierCapacity(event_id, tier.clone());
+        if let Some(cap) = env.storage().persistent().get::<_, u64>(&cap_key) {
+            if next > cap {
+                return Err(Error::TierSoldOut);
+            }
+        }
+        let issued_key = DataKey::TierIssued(event_id, tier.clone());
+        env.storage().persistent().set(&issued_key, &next);
+        env.storage()
+            .persistent()
+            .extend_ttl(&issued_key, LEDGER_THRESHOLD, LEDGER_BUMP);
+        Ok(())
+    }
+
+    /// Pays a resale royalty to the organizer, or splits it across the event's
+    /// `royalty_splits` when set (issue #90). Each share is `royalty * bps /
+    /// royalty_bps`, and the last recipient takes the rounding remainder so the
+    /// payouts always add up to `royalty`.
+    fn pay_royalty(
+        token_client: &token::Client,
+        buyer: &Address,
+        event: &Event,
+        royalty: i128,
+    ) -> Result<(), Error> {
+        let splits = match &event.royalty_splits {
+            Some(splits) => splits,
+            None => {
+                token_client.transfer(buyer, &event.organizer, &royalty);
+                return Ok(());
+            }
+        };
+        let last = splits.len().saturating_sub(1);
+        let mut paid: i128 = 0;
+        for (i, (recipient, bps)) in splits.iter().enumerate() {
+            let share = if i as u32 == last {
+                royalty - paid
+            } else {
+                royalty.checked_mul(bps as i128).ok_or(Error::MathOverflow)?
+                    / event.royalty_bps as i128
+            };
+            paid += share;
+            if share > 0 {
+                token_client.transfer(buyer, &recipient, &share);
+            }
+        }
+        Ok(())
+    }
+
+    /// Rejects check-in before the window opens or after it closes (issue
+    /// #95). The window is inclusive of `ends_at`.
+    fn ensure_check_in_window(env: &Env, event: &Event) -> Result<(), Error> {
+        let now = env.ledger().timestamp();
+        if let Some(opens_before) = event.check_in_opens_seconds {
+            if now < event.starts_at.saturating_sub(opens_before) {
+                return Err(Error::CheckInWindowClosed);
+            }
+        }
+        if let Some(ends_at) = event.ends_at {
+            if now > ends_at {
+                return Err(Error::CheckInWindowClosed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Rejects check-in and transfer once a ticket has expired (issue #76).
+    /// A ticket is expired from the instant `ticket_expires_at` is reached.
+    fn ensure_not_expired(env: &Env, event: &Event) -> Result<(), Error> {
+        match event.ticket_expires_at {
+            Some(expires_at) if env.ledger().timestamp() >= expires_at => {
+                Err(Error::TicketExpired)
+            }
+            _ => Ok(()),
+        }
     }
 
     fn enforce_purchase_throttle(env: &Env, buyer: &Address) -> Result<(), Error> {
